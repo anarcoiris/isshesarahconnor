@@ -10,3 +10,5 @@ tqdm
 opencv-python
 albumentations  # opcional
 serpapi  # si se usa script secundario de descarga
+facenet-pytorch
+numpy
