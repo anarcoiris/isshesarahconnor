@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 torch==2.0.1
 torchvision==0.15.2
 Pillow==9.5.0
@@ -12,3 +13,22 @@ albumentations  # opcional
 serpapi  # si se usa script secundario de descarga
 facenet-pytorch
 numpy
+face_recognition
+requests
+imagehash
+=======
+torch==2.0.1
+torchvision==0.15.2
+Pillow==9.5.0
+flask==2.1.0
+werkzeug==2.0.3
+icrawler
+scikit-learn
+tensorboard
+tqdm
+opencv-python
+albumentations  # opcional
+serpapi  # si se usa script secundario de descarga
+facenet-pytorch
+numpy
+>>>>>>> refs/remotes/origin/main
