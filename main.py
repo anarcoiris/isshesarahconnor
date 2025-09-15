@@ -2,22 +2,21 @@
 """
 pipeline_all_in_one.py
 
-Unifica: fetch (SerpAPI/icrawler), preprocess (crop faces, normalize, dedup), train (robust AMP/resume),
-diagnose, export (TorchScript/ONNX) y serve (Flask) con una GUI para orquestarlo todo.
+Unifica: fetch (SerpAPI/icrawler), preprocess (crop faces, normalize, dedup), labeler (atributos discriminativos),
+train (robust AMP/resume), diagnose, export (TorchScript/ONNX) y serve (Flask) con una GUI para orquestarlo todo.
 
-Uso:
+Usage:
     python pipeline_all_in_one.py --gui
 
 Notas:
- - Muchas librerías son opcionales; el script detecta disponibilidad y usa fallbacks.
- - Si usas SerpAPI, pon tu API key en la GUI campo 'SerpAPI key' o usa icrawler.
+- Comprueba disponibilidad de librerías y hace fallback cuando faltan.
+- Guarda anotaciones en <crop_folder>/annotations.json por defecto.
 """
 from __future__ import annotations
 
 import argparse
 import base64
 import contextlib
-import csv
 import datetime
 import io
 import json
@@ -30,17 +29,15 @@ import subprocess
 import sys
 import threading
 import time
-import traceback
-import re
 from collections import Counter
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Any
 
 import numpy as np
 from PIL import Image, ImageFile, UnidentifiedImageError, ImageTk
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
-# optional libs (graceful fallback)
+# optional libs detection
 try:
     import face_recognition  # type: ignore
     _HAS_FACE_REC = True
@@ -99,8 +96,8 @@ from flask import Flask, request, jsonify, render_template_string
 
 # data & utils
 import pandas as pd
-from urllib.parse import urlsplit
 import requests
+from urllib.parse import urlsplit
 
 # logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
@@ -111,6 +108,7 @@ logger = logging.getLogger("pipeline_all_in_one")
 # ---------------------------
 BASE_DIR = Path(__file__).resolve().parent
 BLACKLIST_FILE = BASE_DIR / "blacklist_domains.txt"
+FETCH_INDEX = BASE_DIR / ".fetch_index.json"
 
 DEFAULT_TRANSFORM = transforms.Compose([
     transforms.Resize(256),
@@ -134,12 +132,6 @@ def save_json(p: Path, obj):
 def load_json(p: Path):
     with open(p, "r", encoding="utf-8") as f:
         return json.load(f)
-
-def sanitize_foldername(s: str, maxlen: int = 60) -> str:
-    s = s.strip()
-    s = re.sub(r'\s+', '_', s)
-    s = re.sub(r'[^\w\-_]', '', s)
-    return s[:maxlen] or "query"
 
 # ---------------------------
 # Downloader: serpapi + requests with blacklist logging
@@ -166,12 +158,8 @@ def download_url_to(path: Path, url: str, timeout=10, max_bytes=None) -> Tuple[b
         try:
             r = requests.get(url, headers=HEADERS, timeout=timeout, stream=True, verify=True)
             if r.status_code == 403:
-                # log domain
-                try:
-                    with open(BLACKLIST_FILE, "a", encoding="utf-8") as f:
-                        f.write(domain + "\n")
-                except Exception:
-                    pass
+                with open(BLACKLIST_FILE, "a", encoding="utf-8") as f:
+                    f.write(domain + "\n")
                 return False, "status_403"
             if r.status_code != 200:
                 return False, f"status_{r.status_code}"
@@ -185,11 +173,8 @@ def download_url_to(path: Path, url: str, timeout=10, max_bytes=None) -> Tuple[b
                             return False, "too_big"
             return True, None
         except requests.exceptions.SSLError:
-            try:
-                with open(BLACKLIST_FILE, "a", encoding="utf-8") as f:
-                    f.write(domain + "\n")
-            except Exception:
-                pass
+            with open(BLACKLIST_FILE, "a", encoding="utf-8") as f:
+                f.write(domain + "\n")
             return False, "ssl_error"
         except Exception:
             time.sleep(0.5 + attempt*0.5)
@@ -241,7 +226,6 @@ def icrawler_download(query: str, out_dir: Path, max_num=300, engine="google"):
 # Face detection & crop utilities (tries multiple backends)
 # ---------------------------
 def detect_faces_pil(img: Image.Image) -> List[Tuple[int,int,int,int]]:
-    # return list of boxes (left, top, right, bottom)
     if _HAS_FACE_REC:
         try:
             arr = np.array(img.convert("RGB"))
@@ -286,7 +270,8 @@ def crop_faces_from_image(src_path: Path, dest_dir: Path, margin: float=0.2, min
             w,h = im.size
             boxes = detect_faces_pil(im)
             if not boxes and keep_no_face:
-                target = dest_dir / "noface"; safe_mkdir(target)
+                target = dest_dir / "noface"
+                safe_mkdir(target)
                 outf = target / src_path.name
                 try:
                     im.save(outf, format="JPEG", quality=92)
@@ -301,7 +286,8 @@ def crop_faces_from_image(src_path: Path, dest_dir: Path, margin: float=0.2, min
                 pad_w = int(fw * margin); pad_h = int(fh * margin)
                 L = max(0, l-pad_w); T = max(0, t-pad_h); R = min(w, r+pad_w); B = min(h, b+pad_h)
                 crop = im.crop((L,T,R,B))
-                out_dir = Path(dest_dir); safe_mkdir(out_dir)
+                out_dir = Path(dest_dir)
+                safe_mkdir(out_dir)
                 out_name = out_dir / f"{src_path.stem}_face_{i}.jpg"
                 crop.save(out_name, format="JPEG", quality=92)
                 saved.append(out_name)
@@ -340,174 +326,21 @@ def generate_metadata_for_crops(raw_dir: Path, crop_dir: Path, out_meta: Path):
         logger.exception("Failed saving metadata csv")
 
 # ---------------------------
-# Prepare dataset (internal compact implementation)
+# Dedup (phash) utility (optional)
 # ---------------------------
-def file_hash(path: Path, chunk_size: int = 8192) -> str:
-    h = None
+def compute_phash(path: Path):
+    if not _HAS_IMGHASH:
+        return None
     try:
-        import hashlib
-        h = hashlib.md5()
-        with path.open('rb') as f:
-            for chunk in iter(lambda: f.read(chunk_size), b''):
-                h.update(chunk)
-        return h.hexdigest()
+        with Image.open(path) as im:
+            im = im.convert("RGB")
+            ph = imagehash.phash(im)
+            return str(ph)
     except Exception:
-        return ""
-
-def ensure_unique_filename_internal(dest_dir: Path, base_name: str, ext: str, max_tries: int = 1000) -> Path:
-    candidate = dest_dir / f"{base_name}.{ext}"
-    if not candidate.exists():
-        return candidate
-    for i in range(1, max_tries):
-        candidate = dest_dir / f"{base_name}_{i}.{ext}"
-        if not candidate.exists():
-            return candidate
-    import time, hashlib
-    suffix = hashlib.md5((base_name + str(time.time())).encode()).hexdigest()[:8]
-    return dest_dir / f"{base_name}_{suffix}.{ext}"
-
-def internal_prepare_dataset(raw_root: Path, out_root: Path, train_ratio: float, val_ratio: float, test_ratio: float,
-                             min_size=(50,50), dedupe_phash: bool=False, phash_threshold: int=6, seed: int=42):
-    """
-    Compact internal implementation:
-     - canonicalizes labels by folder name
-     - keeps unique images by MD5
-     - optional perceptual dedupe if imagehash installed
-     - splits and copies to out_root/train|val|test/<label>
-    """
-    raw_root = Path(raw_root)
-    out_root = Path(out_root)
-    if not raw_root.exists():
-        raise FileNotFoundError(f"Raw root {raw_root} not found")
-    # detect top-level label dirs
-    labels_raw = [p.name for p in raw_root.iterdir() if p.is_dir()]
-    def canonical_label(name: str) -> str:
-        n = name.strip().lower()
-        for suf in ['_raw','-raw','_images','-images','_img']:
-            if n.endswith(suf):
-                n = n[:-len(suf)]
-        return n
-    labels_by_canon = {}
-    for lbl in labels_raw:
-        canon = canonical_label(lbl)
-        labels_by_canon.setdefault(canon, []).append(lbl)
-    logger.info("Labels (canonical -> raw): %s", labels_by_canon)
-    items_by_label = {c: [] for c in labels_by_canon}
-    seen_md5 = {}
-    total_examined = 0
-    total_valid = 0
-    for canon, raws in labels_by_canon.items():
-        for rd in raws:
-            pdir = raw_root / rd
-            for p in pdir.rglob("*"):
-                if not p.is_file():
-                    continue
-                total_examined += 1
-                # try open and validate
-                try:
-                    with Image.open(p) as im:
-                        im.load()
-                        if im.mode == 'P':
-                            im = im.convert('RGBA')
-                        if im.mode == 'LA':
-                            im = im.convert('RGBA')
-                        if im.mode == 'CMYK':
-                            im = im.convert('RGB')
-                        if im.mode == 'RGBA':
-                            bg = Image.new("RGB", im.size, (255,255,255))
-                            bg.paste(im, mask=im.split()[3])
-                            im = bg
-                        else:
-                            im = im.convert('RGB')
-                        w,h = im.size
-                        if w < min_size[0] or h < min_size[1]:
-                            continue
-                except Exception:
-                    continue
-                md5 = file_hash(p)
-                if not md5:
-                    continue
-                if md5 in seen_md5:
-                    continue
-                seen_md5[md5] = str(p)
-                items_by_label[canon].append((p, md5))
-                total_valid += 1
-    logger.info("Examined %d files, found %d valid unique images", total_examined, total_valid)
-    # optional phash dedupe
-    if dedupe_phash and _HAS_IMGHASH:
-        import imagehash
-        phash_map = {}
-        kept = {c: [] for c in items_by_label}
-        for canon, items in items_by_label.items():
-            for p, md5 in items:
-                try:
-                    with Image.open(p) as im:
-                        im = im.convert("RGB")
-                        ph = imagehash.phash(im)
-                except Exception:
-                    kept[canon].append((p, md5))
-                    continue
-                collided = False
-                for eph in phash_map.keys():
-                    if (ph - eph) <= phash_threshold:
-                        collided = True
-                        break
-                if not collided:
-                    phash_map[ph] = (p, md5)
-                    kept[canon].append((p, md5))
-        items_by_label = kept
-        total_valid = sum(len(v) for v in items_by_label.values())
-        logger.info("After phash dedupe: %d images remain", total_valid)
-    elif dedupe_phash:
-        logger.warning("imagehash not installed; skipping phash dedupe")
-    # split and copy
-    import random
-    random.seed(seed)
-    out_root.mkdir(parents=True, exist_ok=True)
-    summary = {}
-    for canon, items in items_by_label.items():
-        n = len(items)
-        if n == 0:
-            logger.warning("No images for label '%s', skipping", canon)
-            continue
-        random.shuffle(items)
-        n_train = int(n * train_ratio)
-        n_val = int(n * val_ratio)
-        if n_train == 0 and n >= 1:
-            n_train = 1
-        if n_train + n_val >= n:
-            n_val = max(0, n - n_train - 1)
-        train = items[:n_train]
-        val = items[n_train:n_train + n_val]
-        test = items[n_train + n_val:]
-        summary[canon] = {'total': n, 'train': len(train), 'val': len(val), 'test': len(test)}
-        for split_name, split_list in [('train', train), ('val', val), ('test', test)]:
-            target_dir = out_root / split_name / canon
-            target_dir.mkdir(parents=True, exist_ok=True)
-            for src_path, md5 in split_list:
-                ext = src_path.suffix.lower().lstrip('.') or 'jpg'
-                base_name = src_path.stem
-                safe_base = "".join(c for c in base_name if c.isalnum() or c in ('-','_')).strip()[:60] or md5[:8]
-                dest_path = ensure_unique_filename_internal(target_dir, safe_base, ext)
-                try:
-                    if dest_path.exists():
-                        if file_hash(dest_path) == md5:
-                            continue
-                    shutil.copy2(src_path, dest_path)
-                except Exception:
-                    try:
-                        im = Image.open(src_path)
-                        im = im.convert('RGB')
-                        fallback_name = ensure_unique_filename_internal(target_dir, safe_base, 'jpg')
-                        im.save(fallback_name, format='JPEG', quality=92)
-                    except Exception:
-                        continue
-    logger.info("Dataset prepared at %s", out_root)
-    logger.info("Summary: %s", summary)
-    return summary
+        return None
 
 # ---------------------------
-# Training utilities (compact)
+# Training utilities (compacted)
 # ---------------------------
 def seed_everything(seed: int=42):
     import random
@@ -586,7 +419,7 @@ def autocast_ctx(enabled: bool):
 def create_sampler_if_needed(dataset: datasets.ImageFolder):
     targets = [s[1] for s in dataset.samples]
     classes = sorted(set(targets))
-    class_sample_count = np.array([targets.count(t) for t in classes]) if len(targets) else np.array([])
+    class_sample_count = np.array([targets.count(t) for t in classes])
     if class_sample_count.size and (class_sample_count.max()/(class_sample_count.min()+1e-12) > 1.5):
         weights = 1.0 / torch.tensor([class_sample_count[t] for t in targets], dtype=torch.double)
         return WeightedRandomSampler(weights, num_samples=len(weights), replacement=True)
@@ -668,6 +501,7 @@ def run_training(cfg: Dict, gui_queue: Optional[queue.Queue]=None, stop_event: O
                 p.requires_grad = False
     criterion = nn.CrossEntropyLoss()
     opt = AdamW(get_parameter_groups(model, weight_decay=cfg.get("weight_decay",1e-4)), lr=cfg.get("lr",1e-4))
+    scheduler = None
     if cfg.get("scheduler","reduce_on_plateau")=="reduce_on_plateau":
         try:
             scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, mode='min', factor=0.5, patience=3, verbose=True)
@@ -684,11 +518,10 @@ def run_training(cfg: Dict, gui_queue: Optional[queue.Queue]=None, stop_event: O
             state = ckpt.get("model_state", ckpt)
             new_state = {}
             for k,v in state.items():
-                nk = k.replace("module.","")
-                new_state[nk] = v
+                new_state[k.replace("module.","")] = v
             model.load_state_dict(new_state)
             try:
-                opt.load_state_dict(ckpt["optimizer_state"])
+                opt.load_state_dict(ckpt.get("optimizer_state", {}))
                 start_epoch = ckpt.get("epoch",1)+1
                 best_val = ckpt.get("best_val_loss",best_val)
             except Exception:
@@ -707,7 +540,7 @@ def run_training(cfg: Dict, gui_queue: Optional[queue.Queue]=None, stop_event: O
         train_loss = train_one_epoch(model, train_loader, criterion, opt, device, scaler, stop_event, max_grad_norm=cfg.get("grad_clip",None))
         eval_res = evaluate(model, val_loader, criterion, device)
         val_loss = eval_res["val_loss"]; val_acc = eval_res["accuracy"]
-        if cfg.get("scheduler","reduce_on_plateau")=="reduce_on_plateau":
+        if scheduler is not None and cfg.get("scheduler","reduce_on_plateau")=="reduce_on_plateau":
             try: scheduler.step(val_loss)
             except Exception: pass
         else:
@@ -773,7 +606,105 @@ def export_model_onnx(model_state_path: str, out_path: str, base_model: str='res
     return out_path
 
 # ---------------------------
-# Flask serve (in-process, runs in background thread)
+# Simple Labeler: schema + annotations
+# ---------------------------
+DEFAULT_SCHEMA = {
+    "pose": {"type": "single", "labels": ["front","profile","three_quarter"], "default":"front"},
+    "age": {"type": "single", "labels": ["young","adult","old"], "default":"adult"},
+    "hair_color": {"type":"single","labels":["black","brown","blonde","red","gray","other"], "default":"brown"},
+    "eye_color": {"type":"single","labels":["brown","blue","green","other"], "default":"brown"},
+    "accessories": {"type":"multi","labels":["glasses","hat","earrings","mask"], "default":[]},
+    "smiling": {"type":"single","labels":["no","yes"], "default":"no"}
+}
+
+class SchemaManager:
+    def __init__(self, path: Optional[Path]=None):
+        self.path = Path(path) if path else None
+        self.schema: Dict[str, Dict] = DEFAULT_SCHEMA.copy()
+    def load(self, path: Optional[Path]=None):
+        p = Path(path) if path else self.path
+        if p and p.exists():
+            with open(p, "r", encoding="utf-8") as f:
+                self.schema = json.load(f)
+        return self.schema
+    def save(self, path: Optional[Path]=None):
+        p = Path(path) if path else self.path
+        if not p:
+            raise ValueError("No path provided to save schema")
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump(self.schema, f, indent=2, ensure_ascii=False)
+    def add_attribute(self, name: str, typ: str="single", labels: Optional[List[str]]=None, default: Any=None):
+        if labels is None: labels=[]
+        self.schema[name] = {"type": typ, "labels": labels, "default": default if default is not None else ([] if typ=="multi" else (labels[0] if labels else None))}
+    def add_label(self, attr: str, label: str):
+        if attr not in self.schema: raise KeyError(attr)
+        if label not in self.schema[attr]["labels"]: self.schema[attr]["labels"].append(label)
+
+class AnnotationStore:
+    def __init__(self, annotations_path: Optional[Path]=None):
+        self.path = Path(annotations_path) if annotations_path else None
+        self.data: Dict[str, Dict] = {}
+    def load(self, path: Optional[Path]=None):
+        p = Path(path) if path else self.path
+        if p and p.exists():
+            with open(p, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+                if isinstance(raw, dict):
+                    self.data = raw
+                else:
+                    self.data = {r["image"]: r for r in raw}
+        return self.data
+    def save(self, path: Optional[Path]=None):
+        p = Path(path) if path else self.path
+        if not p: raise ValueError("No path to save annotations")
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump(self.data, f, indent=2, ensure_ascii=False)
+        try:
+            rows = []
+            for img, ann in self.data.items():
+                row = {"image": img}
+                for k, v in ann.items():
+                    if isinstance(v, list):
+                        row[k] = ";".join([str(x) for x in v])
+                    else:
+                        row[k] = v
+                rows.append(row)
+            df = pd.DataFrame(rows)
+            df.to_csv(p.with_suffix(".csv"), index=False)
+        except Exception:
+            pass
+    def set_annotation(self, image_path: str, ann: Dict):
+        self.data[image_path] = ann
+    def get_annotation(self, image_path: str) -> Dict:
+        return self.data.get(image_path, {})
+    def bulk_apply(self, images: List[str], attr: str, value: Any, schema: SchemaManager):
+        typ = schema.schema[attr]["type"]
+        for img in images:
+            ann = self.get_annotation(img).copy()
+            if typ == "single":
+                ann[attr] = value
+            else:
+                cur = set(ann.get(attr, []))
+                if isinstance(value, list):
+                    cur.update(value)
+                else:
+                    if value in cur: cur.remove(value)
+                    else: cur.add(value)
+                ann[attr] = sorted(list(cur))
+            self.set_annotation(img, ann)
+
+# thumbnail helper
+def make_thumbnail(path: Path, size=(320,320)):
+    try:
+        with Image.open(path) as im:
+            im = im.convert("RGB")
+            im.thumbnail(size, Image.LANCZOS)
+            return im.copy()
+    except Exception:
+        return None
+
+# ---------------------------
+# Flask serve (same as before)
 # ---------------------------
 FLASK_TEMPLATE = """
 <!doctype html>
@@ -791,7 +722,6 @@ FLASK_TEMPLATE = """
 def create_flask_app(model_state_path: Optional[str], labels: Optional[List[str]]=None, base_model:str='resnet50'):
     app = Flask("pipeline_inference")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    logger.info("Flask inference device: %s", device)
     num_classes = len(labels) if labels else 2
     model = build_model(num_classes=num_classes, base_model=base_model, pretrained=False)
     if model_state_path and Path(model_state_path).exists():
@@ -841,8 +771,7 @@ def create_flask_app(model_state_path: Optional[str], labels: Optional[List[str]
             else:
                 data = request.get_json(silent=True) or {}
                 b64 = data.get("image_b64")
-                if not b64:
-                    return jsonify({"error":"no image"}), 400
+                if not b64: return jsonify({"error":"no image"}), 400
                 b = base64.b64decode(b64)
             pil = Image.open(io.BytesIO(b)); pil = pil.convert("RGB")
             t = transform_local(pil).unsqueeze(0).to(device)
@@ -858,123 +787,7 @@ def create_flask_app(model_state_path: Optional[str], labels: Optional[List[str]
     return app
 
 # ---------------------------
-# Labeler support classes
-# ---------------------------
-def make_thumbnail(path_or_pil, size=(340,340)) -> Optional[Image.Image]:
-    try:
-        if isinstance(path_or_pil, (str, Path)):
-            im = Image.open(path_or_pil)
-        else:
-            im = path_or_pil
-        im = im.convert("RGB")
-        if hasattr(Image, "Resampling"):
-            im.thumbnail(size, Image.Resampling.LANCZOS)
-        else:
-            im.thumbnail(size, Image.ANTIALIAS)
-        thumb = Image.new("RGB", size, (40,40,40))
-        x = (size[0] - im.width) // 2
-        y = (size[1] - im.height) // 2
-        thumb.paste(im, (x, y))
-        return thumb
-    except Exception:
-        return None
-
-class SchemaManager:
-    def __init__(self):
-        self.schema: Dict[str, Dict] = {
-            "hair_color": {"type": "single", "labels": ["black", "brown", "blonde", "red", "gray", "other"], "default": "brown"},
-            "eye_color":  {"type": "single", "labels": ["brown", "blue", "green", "other"], "default": "brown"},
-            "accessories": {"type": "multi", "labels": ["glasses", "hat", "earrings"], "default": []}
-        }
-    def add_attr(self, name:str, attr_type:str, labels:List[str], default=None):
-        self.schema[name] = {"type": attr_type, "labels": labels, "default": default if default is not None else (labels[0] if labels else "")}
-    def remove_attr(self, name:str):
-        if name in self.schema:
-            del self.schema[name]
-
-class AnnotationStore:
-    def __init__(self, path: Optional[Path] = None):
-        self.path: Optional[Path] = path
-        self.data: Dict[str, Dict] = {}
-    def load(self, path: Path):
-        self.path = Path(path)
-        if not self.path.exists():
-            self.data = {}
-            return
-        with open(self.path, "r", encoding="utf-8") as f:
-            self.data = json.load(f)
-    def save(self, path: Optional[Path] = None):
-        p = Path(path) if path is not None else self.path
-        if p is None:
-            raise RuntimeError("No path provided for saving annotations")
-        p.parent.mkdir(parents=True, exist_ok=True)
-        with open(p, "w", encoding="utf-8") as f:
-            json.dump(self.data, f, indent=2, ensure_ascii=False)
-        self.path = p
-    def set_annotation(self, img_path: str, ann: Dict):
-        self.data[str(img_path)] = ann
-    def get_annotation(self, img_path: str) -> Dict:
-        return self.data.get(str(img_path), {})
-    def bulk_apply(self, image_paths: List[str], attr: str, value, schema_mgr: SchemaManager):
-        for ip in image_paths:
-            cur = self.get_annotation(ip) or {}
-            meta = schema_mgr.schema.get(attr)
-            if meta is None:
-                continue
-            if meta["type"] == "single":
-                cur[attr] = value
-            else:
-                lst = cur.get(attr, [])
-                if value in lst:
-                    lst.remove(value)
-                else:
-                    lst.append(value)
-                cur[attr] = lst
-            self.set_annotation(ip, cur)
-
-class SchemaDialog:
-    def __init__(self, parent, schema_mgr: SchemaManager):
-        self.top = tk.Toplevel(parent)
-        self.top.title("Schema Manager")
-        self.schema_mgr = schema_mgr
-        self.modified = False
-        self.listbox = tk.Listbox(self.top, height=8)
-        self.listbox.grid(column=0, row=0, columnspan=3, sticky="nsew")
-        self._rebuild_list()
-        ttk.Button(self.top, text="Add attr", command=self._add_attr).grid(column=0, row=1)
-        ttk.Button(self.top, text="Remove selected", command=self._remove_selected).grid(column=1, row=1)
-        ttk.Button(self.top, text="Close", command=self._close).grid(column=2, row=1)
-    def _rebuild_list(self):
-        self.listbox.delete(0, "end")
-        for k, v in self.schema_mgr.schema.items():
-            self.listbox.insert("end", f"{k} ({v['type']}): {','.join(v['labels'])}")
-    def _add_attr(self):
-        name = simpledialog.askstring("Name", "Attribute name", parent=self.top)
-        if not name:
-            return
-        typ = simpledialog.askstring("Type", "Type: single or multi", parent=self.top, initialvalue="single")
-        if typ not in ("single", "multi"):
-            messagebox.showerror("Invalid", "Type must be 'single' or 'multi'")
-            return
-        labs = simpledialog.askstring("Labels", "Comma separated labels", parent=self.top, initialvalue="a,b")
-        labels = [l.strip() for l in labs.split(",") if l.strip()] if labs else []
-        self.schema_mgr.add_attr(name, typ, labels, default=(labels[0] if labels else None))
-        self.modified = True
-        self._rebuild_list()
-    def _remove_selected(self):
-        sel = self.listbox.curselection()
-        if not sel: return
-        idx = sel[0]
-        key = list(self.schema_mgr.schema.keys())[idx]
-        if messagebox.askyesno("Remove", f"Remove attribute {key}?"):
-            self.schema_mgr.remove_attr(key)
-            self.modified = True
-            self._rebuild_list()
-    def _close(self):
-        self.top.destroy()
-
-# ---------------------------
-# GUI: orchestrator
+# GUI orchestrator (integrates labeler tab)
 # ---------------------------
 class PipelineGUI:
     def __init__(self):
@@ -982,71 +795,67 @@ class PipelineGUI:
             raise RuntimeError("Tkinter not available")
         self.root = tk.Tk()
         self.root.title("Unified Pipeline GUI")
-        frm = ttk.Frame(self.root, padding=8)
-        frm.grid(sticky="nsew")
-        nb = ttk.Notebook(frm)
-        nb.grid(column=0,row=0, sticky="nsew")
+        frm = ttk.Frame(self.root, padding=8); frm.grid(sticky="nsew")
+        nb = ttk.Notebook(frm); nb.grid(column=0,row=0, sticky="nsew")
+        # tabs
         self.tab_fetch = ttk.Frame(nb); self.tab_prep = ttk.Frame(nb); self.tab_label = ttk.Frame(nb)
         self.tab_train = ttk.Frame(nb); self.tab_diag = ttk.Frame(nb); self.tab_export = ttk.Frame(nb); self.tab_serve = ttk.Frame(nb)
         nb.add(self.tab_fetch, text="Fetch"); nb.add(self.tab_prep, text="Prep"); nb.add(self.tab_label, text="Labeler")
         nb.add(self.tab_train, text="Train"); nb.add(self.tab_diag, text="Diagnose"); nb.add(self.tab_export, text="Export"); nb.add(self.tab_serve, text="Serve")
 
-        # --- FETCH tab ---
+        # Fetch tab
         ttk.Label(self.tab_fetch, text="Positive query").grid(column=0,row=0,sticky="w")
         self.fetch_pos = ttk.Entry(self.tab_fetch, width=50); self.fetch_pos.insert(0,"Linda Hamilton"); self.fetch_pos.grid(column=1,row=0)
-        ttk.Label(self.tab_fetch, text="Additional queries (one per line)").grid(column=0,row=1,sticky="nw")
-        self.fetch_extra_text = tk.Text(self.tab_fetch, width=50, height=6)
-        self.fetch_extra_text.insert("1.0", "")
-        self.fetch_extra_text.grid(column=1,row=1,sticky="w")
-        ttk.Label(self.tab_fetch, text="Num images per query").grid(column=0,row=2,sticky="w")
-        self.fetch_num = ttk.Entry(self.tab_fetch, width=10); self.fetch_num.insert(0,"500"); self.fetch_num.grid(column=1,row=2,sticky="w")
-        ttk.Label(self.tab_fetch, text="Out folder").grid(column=0,row=3,sticky="w")
-        self.fetch_out = ttk.Entry(self.tab_fetch, width=60); self.fetch_out.insert(0,str(BASE_DIR/"data_fetch")); self.fetch_out.grid(column=1,row=3)
-        ttk.Label(self.tab_fetch, text="SerpAPI key (optional)").grid(column=0,row=4,sticky="w")
-        self.fetch_serp = ttk.Entry(self.tab_fetch, width=60); self.fetch_serp.grid(column=1,row=4)
-        ttk.Button(self.tab_fetch, text="Run fetch", command=self.run_fetch_thread).grid(column=1,row=5,sticky="w")
+        ttk.Label(self.tab_fetch, text="Num images").grid(column=0,row=1,sticky="w")
+        self.fetch_num = ttk.Entry(self.tab_fetch, width=10); self.fetch_num.insert(0,"500"); self.fetch_num.grid(column=1,row=1,sticky="w")
+        ttk.Label(self.tab_fetch, text="Out folder").grid(column=0,row=2,sticky="w")
+        self.fetch_out = ttk.Entry(self.tab_fetch, width=60); self.fetch_out.insert(0,str(BASE_DIR/"data_fetch")); self.fetch_out.grid(column=1,row=2)
+        ttk.Label(self.tab_fetch, text="SerpAPI key (optional)").grid(column=0,row=3,sticky="w")
+        self.fetch_serp = ttk.Entry(self.tab_fetch, width=60); self.fetch_serp.grid(column=1,row=3)
+        ttk.Button(self.tab_fetch, text="Run fetch", command=self.run_fetch_thread).grid(column=1,row=4,sticky="w")
 
-        # --- PREP tab ---
-        ttk.Label(self.tab_prep, text="Raw folder (input)").grid(column=0,row=0,sticky="w")
+        # Prep tab
+        ttk.Label(self.tab_prep, text="Raw folder").grid(column=0,row=0,sticky="w")
         self.raw_folder = ttk.Entry(self.tab_prep, width=70); self.raw_folder.insert(0,str(BASE_DIR/"data_fetch")); self.raw_folder.grid(column=1,row=0)
         ttk.Button(self.tab_prep, text="Browse", command=lambda: self.browse_entry(self.raw_folder)).grid(column=2,row=0)
-        ttk.Label(self.tab_prep, text="Out folder (data/final)").grid(column=0,row=1,sticky="w")
-        self.prep_out = ttk.Entry(self.tab_prep, width=70); self.prep_out.insert(0,str(BASE_DIR/"data_final")); self.prep_out.grid(column=1,row=1)
-        ttk.Button(self.tab_prep, text="Browse", command=lambda: self.browse_entry(self.prep_out)).grid(column=2,row=1)
-        ttk.Label(self.tab_prep, text="Train/Val/Test ratios").grid(column=0,row=2,sticky="w")
-        ratio_frame = ttk.Frame(self.tab_prep); ratio_frame.grid(column=1,row=2,sticky="w")
-        ttk.Label(ratio_frame, text="train").grid(column=0,row=0); self.r_train = ttk.Entry(ratio_frame, width=6); self.r_train.insert(0,"0.7"); self.r_train.grid(column=1,row=0)
-        ttk.Label(ratio_frame, text="val").grid(column=2,row=0);   self.r_val = ttk.Entry(ratio_frame, width=6); self.r_val.insert(0,"0.15"); self.r_val.grid(column=3,row=0)
-        ttk.Label(ratio_frame, text="test").grid(column=4,row=0);  self.r_test = ttk.Entry(ratio_frame, width=6); self.r_test.insert(0,"0.15"); self.r_test.grid(column=5,row=0)
-        self.phash_var = tk.BooleanVar(value=False); ttk.Checkbutton(self.tab_prep, text="Dedupe perceptual (imagehash)", variable=self.phash_var).grid(column=1,row=3,sticky="w")
-        ttk.Label(self.tab_prep, text="phash threshold (lower stricter)").grid(column=0,row=4,sticky="w")
-        self.phash_thresh = ttk.Entry(self.tab_prep, width=6); self.phash_thresh.insert(0,"6"); self.phash_thresh.grid(column=1,row=4,sticky="w")
-        ttk.Button(self.tab_prep, text="Prepare dataset (use scripts/prepare_dataset.py if present)", command=self.run_prepare_thread).grid(column=1,row=5,sticky="w")
-        ttk.Label(self.tab_prep, text="Faces out (for labeler)").grid(column=0,row=6,sticky="w")
-        self.faces_out = ttk.Entry(self.tab_prep, width=70); self.faces_out.insert(0,str(BASE_DIR/"data_faces")); self.faces_out.grid(column=1,row=6)
-        ttk.Button(self.tab_prep, text="Crop faces", command=self.run_crop_thread).grid(column=1,row=7,sticky="w")
-        ttk.Button(self.tab_prep, text="Generate metadata CSV/JSON", command=self.run_meta_thread).grid(column=1,row=8,sticky="w")
+        ttk.Label(self.tab_prep, text="Faces out").grid(column=0,row=1,sticky="w")
+        self.faces_out = ttk.Entry(self.tab_prep, width=70); self.faces_out.insert(0,str(BASE_DIR/"data_faces")); self.faces_out.grid(column=1,row=1)
+        ttk.Button(self.tab_prep, text="Browse", command=lambda: self.browse_entry(self.faces_out)).grid(column=2,row=1)
+        ttk.Label(self.tab_prep, text="Margin").grid(column=0,row=2,sticky="w")
+        self.margin_e = ttk.Entry(self.tab_prep, width=8); self.margin_e.insert(0,"0.2"); self.margin_e.grid(column=1,row=2,sticky="w")
+        ttk.Label(self.tab_prep, text="Min face size").grid(column=0,row=3,sticky="w")
+        self.minface_e = ttk.Entry(self.tab_prep, width=8); self.minface_e.insert(0,"48"); self.minface_e.grid(column=1,row=3,sticky="w")
+        self.keep_no_face = tk.BooleanVar(value=False); ttk.Checkbutton(self.tab_prep, text="Keep no-face copies", variable=self.keep_no_face).grid(column=1,row=4,sticky="w")
+        ttk.Button(self.tab_prep, text="Crop faces", command=self.run_crop_thread).grid(column=1,row=5,sticky="w")
+        ttk.Button(self.tab_prep, text="Generate metadata CSV/JSON", command=self.run_meta_thread).grid(column=1,row=6,sticky="w")
 
-        # Labeler tab
+        # Labeler tab (integrated)
         self.schema_mgr = SchemaManager()
         self.ann_store = AnnotationStore()
         ttk.Label(self.tab_label, text="Faces folder").grid(column=0,row=0,sticky="w")
         self.label_folder_e = ttk.Entry(self.tab_label, width=60); self.label_folder_e.insert(0,str(BASE_DIR/"data_faces")); self.label_folder_e.grid(column=1,row=0)
         ttk.Button(self.tab_label, text="Browse", command=lambda: self.browse_entry(self.label_folder_e)).grid(column=2,row=0)
         ttk.Button(self.tab_label, text="Load images", command=self.label_load_images).grid(column=1,row=1,sticky="w")
+        # left: list
         self.label_listbox = tk.Listbox(self.tab_label, width=40, height=20, selectmode=tk.EXTENDED)
-        self.label_listbox.grid(column=0,row=2, rowspan=8, sticky="ns")
+        self.label_listbox.grid(column=0,row=2, rowspan=6, sticky="ns")
         self.label_listbox.bind("<<ListboxSelect>>", self.label_on_select)
+        # center preview
         self.preview_canvas = tk.Canvas(self.tab_label, width=360, height=360, bg="#222")
         self.preview_canvas.grid(column=1,row=2, rowspan=6)
         navf = ttk.Frame(self.tab_label); navf.grid(column=1,row=8)
         ttk.Button(navf, text="<< Prev", command=self.label_prev).grid(column=0,row=0)
         ttk.Button(navf, text="Next >>", command=self.label_next).grid(column=1,row=0)
         ttk.Button(navf, text="Save annotations", command=self.label_save).grid(column=2,row=0)
+        # right: attributes
         self.attr_frame = ttk.Frame(self.tab_label); self.attr_frame.grid(column=2,row=2)
         ttk.Button(self.tab_label, text="Attribute manager", command=self.open_schema_manager).grid(column=2,row=1)
         ttk.Button(self.tab_label, text="Bulk apply", command=self.label_bulk_apply).grid(column=2,row=3)
         ttk.Button(self.tab_label, text="Export subset", command=self.label_export_subset).grid(column=2,row=4)
+        # bottom: log
+        self.log = tk.Text(frm, width=120, height=14); self.log.grid(column=0,row=2,columnspan=3, pady=(8,0))
+        self.status_var = tk.StringVar(value="idle"); ttk.Label(frm, textvariable=self.status_var).grid(column=0,row=3,sticky="w")
+        handler = TextHandler(self.log); handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s: %(message)s")); logger.addHandler(handler)
 
         # Train tab
         ttk.Label(self.tab_train, text="Data folder (train/val)").grid(column=0,row=0,sticky="w")
@@ -1081,12 +890,6 @@ class PipelineGUI:
         ttk.Button(self.tab_serve, text="Start server", command=self.start_server_thread).grid(column=1,row=3,sticky="w")
         ttk.Button(self.tab_serve, text="Stop server", command=self.stop_server).grid(column=1,row=4,sticky="w")
 
-        # Log area
-        self.log_text = tk.Text(frm, width=120, height=14)
-        self.log_text.grid(column=0,row=1,columnspan=3, pady=(8,0))
-        self.status_var = tk.StringVar(value="idle"); ttk.Label(frm, textvariable=self.status_var).grid(column=0,row=2,sticky="w")
-        handler = TextHandler(self.log_text); handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s: %(message)s")); logger.addHandler(handler)
-
         # internal state
         self.worker = None
         self.gui_queue = queue.Queue()
@@ -1104,13 +907,11 @@ class PipelineGUI:
         self.root.after(200, self._poll_queue)
 
     # ------- helpers -------
-    def log_message(self, *args):
+    def log(self, *args):
         line = " ".join(str(a) for a in args) + "\n"
         try:
-            self.log_text.configure(state='normal')
-            self.log_text.insert('end', line)
-            self.log_text.see('end')
-            self.log_text.configure(state='disabled')
+            self.log.insert("end", line)
+            self.log.see("end")
         except Exception:
             print(line.strip())
 
@@ -1123,66 +924,21 @@ class PipelineGUI:
         if self.worker and self.worker.is_alive():
             messagebox.showinfo("Running","Another task is running")
             return
-        primary_q = self.fetch_pos.get().strip()
-        extras = [l.strip() for l in self.fetch_extra_text.get("1.0", "end").splitlines() if l.strip()]
-        queries = [primary_q] + extras
-        num = int(self.fetch_num.get().strip())
-        out_base = Path(self.fetch_out.get().strip())
+        q = self.fetch_pos.get().strip(); num = int(self.fetch_num.get().strip()); out = Path(self.fetch_out.get().strip())
         serpapi_key = self.fetch_serp.get().strip() or None
         def job():
             self.status_var.set("fetching")
-            safe_mkdir(out_base)
-            for q in queries:
-                subfolder = out_base / sanitize_foldername(q)
-                subfolder.mkdir(parents=True, exist_ok=True)
-                logger.info("Fetching query '%s' -> %s", q, subfolder)
-                try:
-                    if serpapi_key and _HAS_SERPAPI:
-                        serpapi_images_for_query(q, subfolder, max_num=num, serpapi_key=serpapi_key)
-                    elif _HAS_ICRAWLER:
-                        icrawler_download(q, subfolder, max_num=num, engine="google")
-                    else:
-                        logger.error("No fetch backend available (install serpapi or icrawler)")
-                except Exception:
-                    logger.exception("Fetch failed for query '%s'", q)
-            logger.info("All fetches done -> %s", out_base)
-            self.status_var.set("idle")
-        self.worker = threading.Thread(target=job, daemon=True); self.worker.start()
-
-    def run_prepare_thread(self):
-        if self.worker and self.worker.is_alive():
-            messagebox.showinfo("Running","Another task is running")
-            return
-        raw = Path(self.raw_folder.get().strip()); out = Path(self.prep_out.get().strip())
-        try:
-            rtrain = float(self.r_train.get().strip()); rval = float(self.r_val.get().strip()); rtest = float(self.r_test.get().strip())
-        except Exception:
-            messagebox.showerror("Invalid ratios", "Train/Val/Test must be floats that sum to 1.0")
-            return
-        if abs(rtrain + rval + rtest - 1.0) > 1e-6:
-            messagebox.showerror("Invalid ratios", "Train+Val+Test must sum to 1.0")
-            return
-        dedupe_phash = bool(self.phash_var.get())
-        phash_thresh = int(self.phash_thresh.get().strip() or 6)
-        ext_script = Path(__file__).resolve().parent / "scripts" / "prepare_dataset.py"
-        def job():
-            self.status_var.set("preparing")
+            safe_mkdir(out)
             try:
-                if ext_script.exists():
-                    cmd = [sys.executable, str(ext_script), "--raw", str(raw), "--out", str(out), "--train", str(rtrain), "--val", str(rval), "--test", str(rtest)]
-                    if dedupe_phash:
-                        cmd += ["--dedupe_phash", "--phash_threshold", str(phash_thresh)]
-                    logger.info("Calling external prepare_dataset script: %s", " ".join(cmd))
-                    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-                    assert p.stdout
-                    for line in p.stdout:
-                        logger.info("[prepare] %s", line.rstrip())
-                    p.wait()
+                if serpapi_key and _HAS_SERPAPI:
+                    serpapi_images_for_query(q, out, max_num=num, serpapi_key=serpapi_key)
+                elif _HAS_ICRAWLER:
+                    icrawler_download(q, out, max_num=num, engine="google")
                 else:
-                    logger.info("Running internal prepare (fallback)")
-                    internal_prepare_dataset(raw, out, rtrain, rval, rtest, min_size=(50,50), dedupe_phash=dedupe_phash, phash_threshold=phash_thresh, seed=42)
+                    logger.error("No fetch backend available (install serpapi or icrawler)")
+                logger.info("Fetch done -> %s", out)
             except Exception:
-                logger.exception("Prepare dataset failed")
+                logger.exception("Fetch failed")
             self.status_var.set("idle")
         self.worker = threading.Thread(target=job, daemon=True); self.worker.start()
 
@@ -1191,9 +947,7 @@ class PipelineGUI:
             messagebox.showinfo("Running","Another task is running")
             return
         raw = Path(self.raw_folder.get().strip()); out = Path(self.faces_out.get().strip())
-        margin = float(self.margin_e.get().strip()) if hasattr(self, "margin_e") else 0.2
-        minf = int(self.minface_e.get().strip()) if hasattr(self, "minface_e") else 48
-        keep = False
+        margin = float(self.margin_e.get().strip()); minf = int(self.minface_e.get().strip()); keep = bool(self.keep_no_face.get())
         def job():
             self.status_var.set("cropping")
             logger.info("Cropping faces raw=%s out=%s", raw, out)
@@ -1337,14 +1091,16 @@ class PipelineGUI:
         self.label_listbox.delete(0,"end")
         for p in self.label_image_paths:
             self.label_listbox.insert("end", p.name)
+        # set annotations path default
         ann_path = folder / "annotations.json"
         self.ann_store.path = ann_path
         if ann_path.exists():
             try:
                 self.ann_store.load(ann_path)
-                self.log_message(f"Loaded annotations from {ann_path}")
+                self.log(f"Loaded annotations from {ann_path}")
             except Exception:
                 logger.exception("Failed loading annotations")
+        # rebuild attribute controls based on schema
         self.rebuild_label_attr_controls()
         self.label_refresh_preview()
 
@@ -1365,8 +1121,10 @@ class PipelineGUI:
         self.preview_canvas.delete("all")
         self.preview_canvas.create_image(180,180,image=tkimg)
         self.label_tk_image_ref = tkimg
+        # update attr widgets from annotation
         ann = self.ann_store.get_annotation(str(p))
         self.label_update_attr_controls(ann)
+        # select in listbox
         try:
             self.label_listbox.selection_clear(0,"end")
             self.label_listbox.selection_set(self.label_current_index)
@@ -1450,7 +1208,7 @@ class PipelineGUI:
         self.ann_store.set_annotation(str(p), ann)
         try:
             self.ann_store.save(self.ann_store.path)
-            self.log_message(f"Saved annotation for {p.name}")
+            self.log(f"Saved annotation for {p.name}")
         except Exception:
             logger.exception("Failed saving annotation")
 
@@ -1460,14 +1218,14 @@ class PipelineGUI:
             if not p: return
             self.ann_store.path = Path(p)
         self.ann_store.save(self.ann_store.path)
-        self.log_message(f"Annotations saved to {self.ann_store.path}")
+        self.log(f"Annotations saved to {self.ann_store.path}")
 
     def open_schema_manager(self):
         dlg = SchemaDialog(self.root, self.schema_mgr)
         self.root.wait_window(dlg.top)
         if dlg.modified:
             self.rebuild_label_attr_controls()
-            self.log_message("Schema updated")
+            self.log("Schema updated")
 
     def label_bulk_apply(self):
         if not self.label_image_paths: return
@@ -1481,13 +1239,13 @@ class PipelineGUI:
             if val is None: return
             images = [str(self.label_image_paths[i]) for i in self.label_listbox.curselection()] or [str(self.label_image_paths[self.label_current_index])]
             self.ann_store.bulk_apply(images, attr, val, self.schema_mgr)
-            self.log_message(f"Applied {attr}={val} to {len(images)} images")
+            self.log(f"Applied {attr}={val} to {len(images)} images")
         else:
             val = simpledialog.askstring("Value", f"Label to toggle/add (choices: {', '.join(meta['labels'])})")
             if val is None: return
             images = [str(self.label_image_paths[i]) for i in self.label_listbox.curselection()] or [str(self.label_image_paths[self.label_current_index])]
             self.ann_store.bulk_apply(images, attr, val, self.schema_mgr)
-            self.log_message(f"Toggled {val} in {attr} for {len(images)} images")
+            self.log(f"Toggled {val} in {attr} for {len(images)} images")
         self.ann_store.save(self.ann_store.path)
 
     def label_export_subset(self):
@@ -1523,22 +1281,60 @@ class PipelineGUI:
                 dest = target / "images"; dest.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(p, dest / p.name); copied += 1
         messagebox.showinfo("Export done", f"Copied {copied} files to {target}")
-        self.log_message(f"Exported {copied} files to {target}")
+        self.log(f"Exported {copied} files to {target}")
 
-# ---------------------------
-# Text logging handler for Tk Text widget
-# ---------------------------
+# Schema dialog used by labeler
+class SchemaDialog:
+    def __init__(self, parent, schema_mgr: SchemaManager):
+        self.parent = parent; self.schema_mgr = schema_mgr; self.modified = False
+        self.top = tk.Toplevel(parent); self.top.title("Attribute manager")
+        frm = ttk.Frame(self.top, padding=8); frm.grid()
+        self.tree = ttk.Treeview(frm, columns=("type","labels"), show="headings", height=10)
+        self.tree.heading("type", text="Type"); self.tree.heading("labels", text="Labels"); self.tree.grid(column=0,row=0,columnspan=3)
+        self.refresh_tree()
+        ttk.Button(frm, text="Add attribute", command=self.add_attribute).grid(column=0,row=1)
+        ttk.Button(frm, text="Add label", command=self.add_label).grid(column=1,row=1)
+        ttk.Button(frm, text="Save schema", command=self.save_schema).grid(column=2,row=1)
+        ttk.Button(frm, text="Close", command=self.close).grid(column=1,row=2)
+    def refresh_tree(self):
+        for i in self.tree.get_children(): self.tree.delete(i)
+        for k,v in self.schema_mgr.schema.items():
+            typ = v.get("type","single"); labs = ",".join(v.get("labels",[]))
+            self.tree.insert("", "end", iid=k, values=(typ, labs))
+    def add_attribute(self):
+        name = simpledialog.askstring("Attribute name", "New attribute name", parent=self.top)
+        if not name: return
+        typ = simpledialog.askstring("Type", "Type: 'single' or 'multi'", parent=self.top, initialvalue="single")
+        if typ not in ("single","multi"): messagebox.showerror("Invalid","Type must be single or multi"); return
+        labels = simpledialog.askstring("Labels", "Comma-separated labels (example: a,b,c)", parent=self.top)
+        labs = [s.strip() for s in labels.split(",")] if labels else []
+        default = labs[0] if typ=="single" and labs else ([] if typ=="multi" else None)
+        self.schema_mgr.add_attribute(name, typ, labs, default); self.modified=True; self.refresh_tree()
+    def add_label(self):
+        sel = self.tree.selection()
+        if not sel: messagebox.showinfo("Select","Select attribute row first"); return
+        attr = sel[0]
+        lab = simpledialog.askstring("New label", f"New label to add to {attr}", parent=self.top)
+        if not lab: return
+        self.schema_mgr.add_label(attr, lab); self.modified=True; self.refresh_tree()
+    def save_schema(self):
+        p = filedialog.asksaveasfilename(defaultextension=".json", filetypes=[("JSON","*.json")])
+        if not p: return
+        self.schema_mgr.save(Path(p)); messagebox.showinfo("Saved", f"Schema saved to {p}")
+    def close(self):
+        self.top.destroy()
+
+# Text logging handler
 class TextHandler(logging.Handler):
     def __init__(self, text_widget):
-        super().__init__()
-        self.text_widget = text_widget
+        super().__init__(); self.text_widget = text_widget
     def emit(self, record):
         try:
             msg = self.format(record) + "\n"
-            self.text_widget.configure(state='normal')
-            self.text_widget.insert('end', msg)
-            self.text_widget.see('end')
-            self.text_widget.configure(state='disabled')
+            self.text_widget.configure(state="normal")
+            self.text_widget.insert("end", msg)
+            self.text_widget.see("end")
+            self.text_widget.configure(state="disabled")
         except Exception:
             pass
 
@@ -1553,8 +1349,8 @@ def main():
         if not _HAS_TK:
             print("Tkinter not available. Install tkinter or run CLI steps.")
             return
-        app = PipelineGUI()
-        app.root.mainloop()
+        gui = PipelineGUI()
+        gui.root.mainloop()
     else:
         print("Run with --gui to open the interface.")
 
